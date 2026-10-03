@@ -26,7 +26,9 @@ class TaiXuA2uiInputNormalizerTest {
             .jsonObject
 
     private fun seed(json: String) =
-        Json.parseToJsonElement(json).jsonArray.last().jsonObject["updateDataModel"]!!.jsonObject
+        Json.parseToJsonElement(json).jsonArray
+            .first { it.jsonObject.containsKey("updateDataModel") }
+            .jsonObject["updateDataModel"]!!.jsonObject
 
     @Test
     fun `constant value is rewritten to a proxy path and seeded into the data model`() {
