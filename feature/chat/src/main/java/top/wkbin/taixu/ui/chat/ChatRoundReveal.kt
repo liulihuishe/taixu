@@ -28,8 +28,8 @@ internal class RoundRevealState {
     var limit by mutableStateOf(Int.MAX_VALUE)
         private set
 
-    /** 仅当存在揭示中的轮次时才有值；交给投影函数决定放出多少隐藏项。 */
-    val limits: Map<String, Int> get() = roundKey?.let { mapOf(it to limit) } ?: emptyMap()
+    /** 段内已放出的条数上限：未启动揭示、或查询的不是正在揭示的轮次时为 [Int.MAX_VALUE]。 */
+    fun limitFor(roundKey: String): Int = if (this.roundKey == roundKey) limit else Int.MAX_VALUE
 
     fun start(key: String, totalItems: Int) {
         total = totalItems
@@ -53,10 +53,10 @@ internal class RoundRevealState {
         stop()
     }
 
-    /** 折叠条点击的统一入口：需要揭示则启动，否则立即生效（收起 / 隐藏段很短）。 */
-    fun onToggled(item: ChatRenderItem.CollapseButtonItem, wasExpanded: Boolean, enabled: Boolean) {
-        if (!wasExpanded && enabled && item.hiddenItemCount > REVEAL_PER_FRAME) {
-            start(item.roundKey, item.hiddenItemCount)
+    /** 折叠段点击的统一入口：需要揭示则启动，否则立即生效（收起 / 隐藏段很短）。 */
+    fun onToggled(roundKey: String, hiddenItemCount: Int, wasExpanded: Boolean, enabled: Boolean) {
+        if (!wasExpanded && enabled && hiddenItemCount > REVEAL_PER_FRAME) {
+            start(roundKey, hiddenItemCount)
         } else {
             stop()
         }
@@ -81,6 +81,8 @@ internal fun rememberRoundRevealState(): RoundRevealState {
  * 投影 + 缓存键的统一入口。
  * 折叠关闭（默认）时投影不读取 toolResults，因此也不把它列为 remember 键，
  * 避免工具结果变化时白白让投影失效重建（与关闭折叠时的历史行为一致）。
+ * 分帧揭示自折叠段重做后只影响段内渲染（见 [RoundRevealState.limitFor]），
+ * 不再参与投影，故投影结果与揭示进度无关 —— 这正是「条目数不变」的前提。
  */
 @Composable
 internal fun rememberChatRenderItems(
@@ -88,10 +90,9 @@ internal fun rememberChatRenderItems(
     toolResults: Map<String, ToolResult>,
     expandedOverrides: Map<String, Boolean>,
     chatRoundCollapse: Boolean,
-    revealLimits: Map<String, Int>,
 ): List<ChatRenderItem> {
     val projectionToolResults = if (chatRoundCollapse) toolResults else emptyMap()
-    return remember(messages, expandedOverrides, chatRoundCollapse, projectionToolResults, revealLimits) {
-        projectChatMessages(messages, projectionToolResults, expandedOverrides, chatRoundCollapse, revealLimits)
+    return remember(messages, expandedOverrides, chatRoundCollapse, projectionToolResults) {
+        projectChatMessages(messages, projectionToolResults, expandedOverrides, chatRoundCollapse)
     }
 }

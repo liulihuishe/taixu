@@ -48,6 +48,9 @@ class RoundCollapseTest {
     private fun buttons(items: List<ChatRenderItem>): List<ChatRenderItem.CollapseButtonItem> =
         items.filterIsInstance<ChatRenderItem.CollapseButtonItem>()
 
+    private fun segments(items: List<ChatRenderItem>): List<ChatRenderItem.CollapsedSegmentItem> =
+        items.filterIsInstance<ChatRenderItem.CollapsedSegmentItem>()
+
     // ==================== 默认行为：关闭自动折叠（自然单行流） ====================
 
     @Test
@@ -158,7 +161,13 @@ class RoundCollapseTest {
         assertEquals("隐藏步骤耗时应累加对应 ToolResult 的 durationMs", 1200L, foldButtons[0].hiddenDurationMs)
         assertFalse(foldButtons[0].isExpanded)
 
-        // 用户气泡 + 折叠按钮 + 最新 2 步 + 最终正文；下一轮不受影响
+        // 折叠段重做：隐藏消息合并进**单个**段渲染项，不再逐条产出
+        val segment = segments(items).single()
+        assertEquals("u1", segment.roundKey)
+        assertFalse(segment.isExpanded)
+        assertEquals("段内隐藏集合 = 收拢时消失的那些消息", listOf("t1"), segment.hiddenMessages.map { it.id })
+
+        // 用户气泡 + 折叠条 + 折叠段 + 最新 2 步 + 最终正文；下一轮不受影响
         assertEquals(listOf("u1", "t2", "t3", "a1", "u2", "a2"), messageIds(items))
     }
 
@@ -176,6 +185,7 @@ class RoundCollapseTest {
         )
         val items = projectChatMessages(messages, emptyMap(), emptyMap(), collapseEnabled = true)
         assertTrue(buttons(items).isEmpty())
+        assertTrue("≤ 2 步的轮次也不应产出折叠段", segments(items).isEmpty())
         assertEquals(listOf("u1", "t1", "t2", "a1", "u2", "a2"), messageIds(items))
     }
 
@@ -197,6 +207,7 @@ class RoundCollapseTest {
         )
         val items = projectChatMessages(messages, emptyMap(), emptyMap(), collapseEnabled = true)
         assertTrue("进行中的最后一轮必须始终摊开", buttons(items).isEmpty())
+        assertTrue("进行中的最后一轮不应产出折叠段", segments(items).isEmpty())
         assertEquals(listOf("u1", "t1", "t2", "t3", "t4", "t5", "a1"), messageIds(items))
     }
 
@@ -223,8 +234,14 @@ class RoundCollapseTest {
         val foldButtons = buttons(items)
         assertEquals(1, foldButtons.size)
         assertTrue(foldButtons[0].isExpanded)
-        assertEquals("摊开态不隐藏任何步骤", 0, foldButtons[0].hiddenSteps)
-        assertEquals(listOf("u1", "t1", "t2", "t3", "a1", "u2", "a2"), messageIds(items))
+        assertEquals("摊开态下折叠条数值仍为 N = M-2（文案显示为「收起」）", 1, foldButtons[0].hiddenSteps)
+        assertEquals("隐藏条数需在收拢/摊开两态一致，展开时据此启动分帧揭示", 1, foldButtons[0].hiddenItemCount)
+
+        // 隐藏消息只存在于段内（段内自行控制逐帧放出量），不再作为独立条目产出
+        val segment = segments(items).single()
+        assertTrue(segment.isExpanded)
+        assertEquals(listOf("t1"), segment.hiddenMessages.map { it.id })
+        assertEquals(listOf("u1", "t2", "t3", "a1", "u2", "a2"), messageIds(items))
     }
 
     @Test
@@ -248,6 +265,7 @@ class RoundCollapseTest {
         val foldButtons = buttons(items)
         assertEquals(1, foldButtons.size)
         assertFalse("用户显式收拢的意图优先于末轮规则", foldButtons[0].isExpanded)
+        assertFalse(segments(items).single().isExpanded)
         assertEquals(listOf("u1", "t2", "t3", "a1"), messageIds(items))
     }
 
@@ -269,6 +287,11 @@ class RoundCollapseTest {
         val items = projectChatMessages(messages, emptyMap(), emptyMap(), collapseEnabled = true)
         // t1 被隐藏 → 紧随其后的中间正文 a_mid 一并隐藏；最终正文永远可见
         assertEquals(listOf("u1", "t2", "t3", "a_final", "u2", "a2"), messageIds(items))
+        assertEquals(
+            "中间正文与其前置隐藏工具卡一起进段（顺序保持原始顺序）",
+            listOf("t1", "a_mid"),
+            segments(items).single().hiddenMessages.map { it.id },
+        )
     }
 
     @Test
@@ -344,7 +367,7 @@ class RoundCollapseTest {
         assertEquals(7, rawIndexById(folded, "a1"))
     }
 
-    // ==================== 分帧揭示（revealLimits） ====================
+    // ==================== 折叠段：隐藏集合 / 条目数不变性 / 分帧揭示契约 ====================
 
     /** 3 步轮次里，被折叠时会消失的渲染条目 = 最旧 1 个工具卡 + 跟随它的中间正文 = 2 条。 */
     private fun revealFixtures(): List<HarnessMessage> = listOf(
@@ -362,42 +385,93 @@ class RoundCollapseTest {
     )
 
     @Test
-    fun `revealLimits caps how many hidden items are released per frame`() {
-        val items = projectChatMessages(
-            revealFixtures(),
-            emptyMap(),
-            mapOf("u1" to true),
-            collapseEnabled = true,
-            revealLimits = mapOf("u1" to 1),
-        )
-        val button = buttons(items).single()
-        assertTrue(button.isExpanded)
-        assertEquals("隐藏段总条目数应上报给 UI 用于分帧步长", 2, button.hiddenItemCount)
-        // 只放出第 1 条隐藏项（t1），紧随其后的中间正文 a_mid 仍被压住
-        assertEquals(listOf("u1", "t1", "t2", "t3", "a_final", "u2", "a2"), messageIds(items))
-    }
+    fun `expanded segment keeps exactly the same hidden messages as collapsed one`() {
+        val collapsed = projectChatMessages(revealFixtures(), emptyMap(), emptyMap(), collapseEnabled = true)
+        val expanded = projectChatMessages(revealFixtures(), emptyMap(), mapOf("u1" to true), collapseEnabled = true)
 
-    @Test
-    fun `revealLimits default releases every hidden item at once`() {
-        val items = projectChatMessages(
-            revealFixtures(),
-            emptyMap(),
-            mapOf("u1" to true),
-            collapseEnabled = true,
-        )
-        val button = buttons(items).single()
-        assertEquals(2, button.hiddenItemCount)
+        val collapsedSegment = segments(collapsed).single()
+        val expandedSegment = segments(expanded).single()
+        assertEquals(listOf("t1", "a_mid"), collapsedSegment.hiddenMessages.map { it.id })
         assertEquals(
-            listOf("u1", "t1", "a_mid", "t2", "t3", "a_final", "u2", "a2"),
-            messageIds(items),
+            "两态的 hiddenMessages 必须完全一致（只有 isExpanded 不同）",
+            collapsedSegment.hiddenMessages.map { it.id },
+            expandedSegment.hiddenMessages.map { it.id },
+        )
+        assertFalse(collapsedSegment.isExpanded)
+        assertTrue(expandedSegment.isExpanded)
+    }
+
+    @Test
+    fun `hidden messages are never emitted as standalone render items`() {
+        val collapsed = projectChatMessages(revealFixtures(), emptyMap(), emptyMap(), collapseEnabled = true)
+        val expanded = projectChatMessages(revealFixtures(), emptyMap(), mapOf("u1" to true), collapseEnabled = true)
+        listOf(collapsed, expanded).forEach { items ->
+            val ids = messageIds(items)
+            assertTrue("隐藏消息不得作为独立渲染项产出（否则会重新引入插入/删除重排）", ids.none { it == "t1" || it == "a_mid" })
+        }
+    }
+
+    @Test
+    fun `item count and keys stay identical between collapsed and expanded states`() {
+        val collapsed = projectChatMessages(revealFixtures(), emptyMap(), emptyMap(), collapseEnabled = true)
+        val expanded = projectChatMessages(revealFixtures(), emptyMap(), mapOf("u1" to true), collapseEnabled = true)
+
+        assertEquals(
+            "同一轮收拢/摊开两态条目数差值必须为 0（折叠段重做的核心保证）",
+            0,
+            collapsed.size - expanded.size,
+        )
+        assertEquals(
+            "条目 key 序列一致 → LazyColumn 不会把展开/收起当成插入/删除",
+            collapsed.map { it.stableKey },
+            expanded.map { it.stableKey },
         )
     }
 
     @Test
-    fun `collapsed round reports zero hidden item count`() {
+    fun `segment carries raw indexes so the segment can render without rescanning messages`() {
+        val expanded = projectChatMessages(revealFixtures(), emptyMap(), mapOf("u1" to true), collapseEnabled = true)
+        val hiddenItems = segments(expanded).single().hiddenItems
+        assertEquals(listOf("t1", "a_mid"), hiddenItems.map { it.message.id })
+        // revealFixtures 中 t1 = index 1、a_mid = index 3
+        assertEquals(listOf(1, 3), hiddenItems.map { it.rawIndex })
+    }
+
+    @Test
+    fun `reveal layer reports no limit while idle and one item per frame after start`() {
+        val state = RoundRevealState()
+        assertEquals("未启动揭示时限流应为 Int.MAX_VALUE（段内一次放完）", Int.MAX_VALUE, state.limitFor("u1"))
+
+        state.start("u1", 4)
+        assertEquals("首帧放出 1 条", 1, state.limitFor("u1"))
+        assertEquals("其它轮次不受影响", Int.MAX_VALUE, state.limitFor("u2"))
+
+        state.stop()
+        assertEquals("停止后回到 Int.MAX_VALUE", Int.MAX_VALUE, state.limitFor("u1"))
+    }
+
+    @Test
+    fun `toggling with a single hidden item never starts frame-by-frame reveal`() {
+        val state = RoundRevealState()
+        state.onToggled(roundKey = "u1", hiddenItemCount = 1, wasExpanded = false, enabled = true)
+        assertEquals("隐藏段 ≤ 1 条时立即放完，不启动揭示", Int.MAX_VALUE, state.limitFor("u1"))
+
+        state.onToggled(roundKey = "u1", hiddenItemCount = 2, wasExpanded = false, enabled = true)
+        assertEquals("隐藏段 > 1 条时启动揭示", 1, state.limitFor("u1"))
+
+        state.onToggled(roundKey = "u1", hiddenItemCount = 2, wasExpanded = true, enabled = true)
+        assertEquals("收起时立即复位，不做延迟", Int.MAX_VALUE, state.limitFor("u1"))
+    }
+
+    @Test
+    fun `collapsed round reports the hidden item count so expanding can start the reveal`() {
         val items = projectChatMessages(revealFixtures(), emptyMap(), emptyMap(), collapseEnabled = true)
         val button = buttons(items).single()
         assertFalse(button.isExpanded)
-        assertEquals("收拢态不参与分帧揭示，条目数恒为 0", 0, button.hiddenItemCount)
+        assertEquals(
+            "收拢态必须上报隐藏条数，否则点击展开时无从启动分帧揭示（旧版恒为 0）",
+            2,
+            button.hiddenItemCount,
+        )
     }
 }

@@ -8,6 +8,11 @@ import top.wkbin.taixu.harness.UserMessage
 
 /** 消息流渲染的通用纯函数工具：间距判定 / 推理去重 / 时长与 token 格式化。 */
 internal fun isThinkingOrActionItem(item: ChatRenderItem?): Boolean {
+    if (item is ChatRenderItem.CollapsedSegmentItem) {
+        // 折叠段展开后，「段尾」即段内最后一条消息，间距规则需与逐条平铺时一致；
+        // 收拢态段内消息并不在列表中，固定按非思考项处理（与旧的折叠条项一致）。
+        return item.isExpanded && item.trailingIsThinking
+    }
     if (item !is ChatRenderItem.MessageItem) return false
     return when (val msg = item.message) {
         is ToolCall, is CapabilityEvent -> true

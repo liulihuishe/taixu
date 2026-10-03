@@ -23,4 +23,7 @@ dependencies {
     implementation(libs.bundles.coil)
 
     testImplementation(libs.bundles.test.robolectric)
+    // 折叠段分帧揭示的单测需要驱动 MonotonicFrameClock（BroadcastFrameClock），
+    // 与 harness/tools/runtime 的测试一致，显式声明协程而不是依赖传递。
+    testImplementation(libs.kotlinx.coroutines.core)
 }

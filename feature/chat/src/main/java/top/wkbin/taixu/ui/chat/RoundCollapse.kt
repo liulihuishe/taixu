@@ -39,6 +39,36 @@ sealed interface ChatRenderItem {
     ) : ChatRenderItem {
         override val stableKey: String get() = "collapse_btn_$roundKey"
     }
+
+    /**
+     * 折叠段：一轮中被折叠的**全部历史过程**合并成的单个渲染项。
+     *
+     * 收拢/摊开两态产出的条目结构完全同构（只有 [isExpanded] 不同），因此折叠/展开时
+     * LazyColumn 的条目数不变——不再插入/删除 N 个条目，也就不会发生列表重排；
+     * 段内消息由渲染层按帧逐条放出（见 RoundRevealState.limitFor）。
+     */
+    data class CollapsedSegmentItem(
+        val roundKey: String,
+        val hiddenSteps: Int,
+        val totalSteps: Int,
+        val hiddenDurationMs: Long,
+        val isExpanded: Boolean,
+        /** 段内隐藏消息（原始顺序）。 */
+        val hiddenMessages: List<HarnessMessage>,
+        /** 段内消息在原始 messages 中的下标（与 [hiddenMessages] 同序，供段内 O(1) 取用）。 */
+        val hiddenRawIndexes: List<Int> = emptyList(),
+    ) : ChatRenderItem {
+        override val stableKey: String get() = "collapse_segment_$roundKey"
+
+        /** 段内消息渲染项（已带预算 rawIndex），供渲染层逐帧放出。 */
+        val hiddenItems: List<MessageItem> = hiddenMessages.mapIndexed { index, message ->
+            MessageItem(message, rawIndex = hiddenRawIndexes.getOrElse(index) { -1 })
+        }
+
+        /** 段尾是否为「思考/动作」项：展开态的间距规则需与逐条平铺时完全一致。 */
+        val trailingIsThinking: Boolean =
+            hiddenMessages.lastOrNull()?.let { isThinkingOrActionItem(MessageItem(it)) } ?: false
+    }
 }
 
 /**
@@ -70,7 +100,6 @@ fun projectChatMessages(
     toolResults: Map<String, ToolResult> = emptyMap(),
     expandedOverrides: Map<String, Boolean> = emptyMap(),
     collapseEnabled: Boolean = false,
-    revealLimits: Map<String, Int> = emptyMap(),
 ): List<ChatRenderItem> {
     if (messages.isEmpty()) return emptyList()
 
@@ -113,46 +142,12 @@ fun projectChatMessages(
             else -> true
         }
 
-        if (!shouldCollapse) {
-            // 摊开态：若该轮本处于折叠态且被手动展开，在轮顶补一个「收起」按钮。
-            // 隐藏段（= 折叠时会消失的那些条目）用于「分帧揭示」：一次性插入 N 张重卡
-            // 会在同一帧内完成组合，长轮次必然掉帧，故按帧逐批放出（见 revealLimits）。
-            val revealLimit = revealLimits[round.roundKey] ?: Int.MAX_VALUE
-            val hiddenToolCallIdSet: Set<String> =
-                if (totalSteps > 2) round.toolCalls.take(totalSteps - 2).map { it.id }.toSet() else emptySet()
-            val hiddenItemIdSet: Set<String> =
-                if (manualOverride == true && hiddenToolCallIdSet.isNotEmpty()) {
-                    val stillVisible = filterVisibleMessagesByFollowRule(round.nonResultMessages, hiddenToolCallIdSet)
-                        .mapTo(HashSet()) { it.id }
-                    round.nonResultMessages
-                        .filter { it !is UserMessage && it.id !in stillVisible }
-                        .mapTo(HashSet()) { it.id }
-                } else {
-                    emptySet()
-                }
-            if (totalSteps > 2 && manualOverride == true) {
-                result.add(
-                    ChatRenderItem.CollapseButtonItem(
-                        roundKey = round.roundKey,
-                        hiddenSteps = 0,
-                        totalSteps = totalSteps,
-                        hiddenDurationMs = 0L,
-                        isExpanded = true,
-                        hiddenItemCount = hiddenItemIdSet.size,
-                    ),
-                )
-            }
-            var revealedItems = 0
-            for (msg in round.nonResultMessages) {
-                if (msg is UserMessage) continue
-                if (msg.id in hiddenItemIdSet) {
-                    if (revealedItems >= revealLimit) continue
-                    revealedItems++
-                }
-                result.add(ChatRenderItem.MessageItem(msg, rawIndex = rawIndexOf[msg.id] ?: -1))
-            }
-        } else {
-            // 收拢态：隐藏最旧的 (totalSteps - 2) 步，保留最新 2 步
+        // 折叠段：把一轮里被折叠的**全部历史过程**收成单个渲染项。
+        // 收拢/摊开两态产出同一份数据（只有 isExpanded 不同），因此折叠/展开时
+        // LazyColumn 条目数不变 —— 不再插入/删除 N 个条目，也就没有整表重排。
+        // 段内消息的逐帧放出交给渲染层（见 RoundRevealState.limitFor）。
+        val hasSegment = totalSteps > 2 && (shouldCollapse || manualOverride == true)
+        if (hasSegment) {
             val hiddenCount = totalSteps - 2
             val hiddenToolCalls = round.toolCalls.take(hiddenCount)
             val hiddenToolCallIds = hiddenToolCalls.map { it.id }.toSet()
@@ -160,24 +155,47 @@ fun projectChatMessages(
             // 累计被隐藏步骤的执行耗时
             val hiddenDurationMs = hiddenToolCalls.sumOf { toolResults[it.id]?.durationMs ?: 0L }
 
+            val visibleMessages = filterVisibleMessagesByFollowRule(
+                messages = round.nonResultMessages,
+                hiddenToolCallIds = hiddenToolCallIds,
+            )
+            val visibleIds = visibleMessages.mapTo(HashSet()) { it.id }
+            val hiddenMessages = round.nonResultMessages
+                .filter { it !is UserMessage && it.id !in visibleIds }
+
+            // 折叠条（轮顶）与折叠段（紧随其后的单个占位项）在同一次投影里一起产出：
+            // 收拢/摊开只改 isExpanded，条目数不变，因此点击展开/收起不会插入或删除条目。
             result.add(
                 ChatRenderItem.CollapseButtonItem(
                     roundKey = round.roundKey,
                     hiddenSteps = hiddenCount,
                     totalSteps = totalSteps,
                     hiddenDurationMs = hiddenDurationMs,
-                    isExpanded = false,
+                    isExpanded = !shouldCollapse,
+                    hiddenItemCount = hiddenMessages.size,
                 ),
             )
-
-            val visibleMessages = filterVisibleMessagesByFollowRule(
-                messages = round.nonResultMessages,
-                hiddenToolCallIds = hiddenToolCallIds,
+            result.add(
+                ChatRenderItem.CollapsedSegmentItem(
+                    roundKey = round.roundKey,
+                    hiddenSteps = hiddenCount,
+                    totalSteps = totalSteps,
+                    hiddenDurationMs = hiddenDurationMs,
+                    isExpanded = !shouldCollapse,
+                    hiddenMessages = hiddenMessages,
+                    hiddenRawIndexes = hiddenMessages.map { rawIndexOf[it.id] ?: -1 },
+                ),
             )
             for (msg in visibleMessages) {
                 if (msg !is UserMessage) {
                     result.add(ChatRenderItem.MessageItem(msg, rawIndex = rawIndexOf[msg.id] ?: -1))
                 }
+            }
+        } else {
+            // 自然摊开（≤2 步，或进行中的末轮且无手动覆盖）：与既有行为完全一致，逐条平铺。
+            for (msg in round.nonResultMessages) {
+                if (msg is UserMessage) continue
+                result.add(ChatRenderItem.MessageItem(msg, rawIndex = rawIndexOf[msg.id] ?: -1))
             }
         }
     }

@@ -50,9 +50,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import top.wkbin.taixu.harness.AssistantText
 import top.wkbin.taixu.harness.HarnessMessage
-import top.wkbin.taixu.harness.HarnessTool
-import top.wkbin.taixu.harness.CapabilityEvent
-import top.wkbin.taixu.harness.ModelSwitchEvent
 import top.wkbin.taixu.harness.SkillSuggestion
 import top.wkbin.taixu.harness.ToolCall
 import top.wkbin.taixu.harness.checkpoint.RewindScope
@@ -131,7 +128,36 @@ internal fun ChatMessageList(
     var expandedOverrides by rememberSaveable(stateSaver = ExpandedOverridesSaver) { mutableStateOf(mapOf<String, Boolean>()) }
 
     val reveal = rememberRoundRevealState()
-    val renderItems = rememberChatRenderItems(messages, toolResults, expandedOverrides, chatRoundCollapse, reveal.limits)
+    val renderItems = rememberChatRenderItems(messages, toolResults, expandedOverrides, chatRoundCollapse)
+    // 单条消息渲染的上下文与回调：外移到 ChatMessageItemContent.kt 后按组传入，
+    // 内容与 ChatMessageList 的入参一一对应（含折叠段内消息复用同一份渲染）。
+    val itemEnv = ChatMessageItemEnv(
+        messages = messages,
+        toolResults = toolResults,
+        running = running,
+        status = status,
+        workspace = workspace,
+        thinkingExpanded = thinkingExpanded,
+        thinkingAutoTranslate = thinkingAutoTranslate,
+        thinkingLive = thinkingLive,
+        liveThinkingMessageId = liveThinkingMessageId,
+        lastAssistantMessageId = lastAssistantMessageId,
+        onNavigateToSettings = onNavigateToSettings,
+        knownMentionNames = knownMentionNames,
+        onEditMessage = onEditMessage,
+        onDeleteMessage = onDeleteMessage,
+        onCreateBranch = onCreateBranch,
+        onRewindMessage = onRewindMessage,
+        onRegenerate = onRegenerate,
+        onRetryTool = onRetryTool,
+        onOpenFile = onOpenFile,
+        onViewSubagentLanes = onViewSubagentLanes,
+        subagentBranches = subagentBranches,
+        onOpenSubagent = onOpenSubagent,
+        hiddenSkillSuggestions = hiddenSkillSuggestions,
+        onApplySkillSuggestion = onApplySkillSuggestion,
+        onDismissSkillSuggestion = onDismissSkillSuggestion,
+    )
     val waitingForFirstOutput = remember(
         // 只依赖「末条消息的 id + 其内容签名」：流式期间末条内容变化会改变签名（真正需要重算），
         // 而历史消息变化不影响该判定，因此无需依赖整个 messages 列表引用（避免每帧 O(n) 重算）。
@@ -194,14 +220,8 @@ internal fun ChatMessageList(
                 }
             }
             itemsIndexed(renderItems, key = { _, item -> item.stableKey }) { index, item ->
-                val top = when {
-                    item is ChatRenderItem.MessageItem && item.message is UserMessage -> 12.dp
-                    // 思考过程、工具调用卡片、能力事件之间的垂直外边距压至紧凑的 2.5dp
-                    isThinkingOrActionItem(item) && isThinkingOrActionItem(renderItems.getOrNull(index - 1)) -> 2.5.dp
-                    // 思考/工具刚结束紧接的最终回复气泡间距压缩为 4dp
-                    item is ChatRenderItem.MessageItem && item.message is AssistantText && isThinkingOrActionItem(renderItems.getOrNull(index - 1)) -> 4.dp
-                    else -> 8.dp
-                }
+                // 间距规则外移到 ChatMessageItemContent.kt 的 chatItemTopSpacing（列表项与折叠段内消息共用）
+                val top = chatItemTopSpacing(renderItems.getOrNull(index - 1), item)
                 if (index > 0) Spacer(Modifier.height(top))
                 when (item) {
                     is ChatRenderItem.CollapseButtonItem -> {
@@ -210,70 +230,17 @@ internal fun ChatMessageList(
                             onToggle = {
                                 val wasExpanded = item.isExpanded
                                 expandedOverrides = expandedOverrides + (item.roundKey to !wasExpanded)
-                                reveal.onToggled(item, wasExpanded, chatRoundCollapse)
+                                reveal.onToggled(item.roundKey, item.hiddenItemCount, wasExpanded, chatRoundCollapse)
                             },
                         )
                     }
-                    is ChatRenderItem.MessageItem -> {
-                        when (val message = item.message) {
-                            is CapabilityEvent -> CapabilityEventCard(message)
-                            is SkillSuggestion -> if (message.id !in hiddenSkillSuggestions) {
-                                SkillSuggestionCard(
-                                    suggestion = message,
-                                    onCreate = { onApplySkillSuggestion(message, true) },
-                                    onUpdate = { onApplySkillSuggestion(message, false) },
-                                    onDismiss = { onDismissSkillSuggestion(message.id) },
-                                )
-                            }
-                            is ModelSwitchEvent -> ModelSwitchCard(message)
-                            is UserMessage -> UserBubble(
-                                message = message,
-                                knownMentionNames = knownMentionNames,
-                                onEdit = { onEditMessage(message) },
-                                onDelete = { onDeleteMessage(message.id) },
-                                onCreateBranch = { onCreateBranch(message.id) },
-                                onRewind = { scope -> onRewindMessage(message.id, scope) },
-                            )
-                            is AssistantText -> AssistantBubble(
-                                message = message,
-                                defaultExpanded = thinkingExpanded,
-                                live = thinkingLive && message.id == liveThinkingMessageId,
-                                showRegenerate = message.id == lastAssistantMessageId,
-                                onRegenerate = onRegenerate,
-                                onCreateBranch = { onCreateBranch(message.id) },
-                                autoTranslate = thinkingAutoTranslate,
-                                onNavigateToSettings = onNavigateToSettings,
-                            )
-                            is ToolCall -> {
-                                // 原始下标由投影阶段预计算（见 projectChatMessages），组合期 O(1)，
-                                // 不再在每个 Lazy 项里对 messages 做 indexOfFirst 的 O(n) 全表扫描。
-                                val rawIndex = item.rawIndex
-                                if (message.tool == HarnessTool.SUBAGENT) {
-                                    SubagentCard(
-                                        call = message,
-                                        result = toolResults[message.id],
-                                        subagentBranches = subagentBranches,
-                                        onOpenSubagent = onOpenSubagent,
-                                        onViewDetails = onViewSubagentLanes,
-                                    )
-                                } else {
-                                    ToolCard(
-                                        call = message,
-                                        result = toolResults[message.id],
-                                        workspace = workspace,
-                                        onOpenFile = onOpenFile,
-                                        running = running,
-                                        liveStatus = status,
-                                        showReasoning = message.reasoning != null &&
-                                            !reasoningAlreadyShown(messages, rawIndex, message.reasoning),
-                                        defaultExpanded = thinkingExpanded,
-                                        onRetry = { onRetryTool(message.id) },
-                                    )
-                                }
-                            }
-                            is ToolResult -> Unit
-                        }
-                    }
+                    // 折叠段：整段隐藏过程只占**一个** Lazy item，展开/收起只改高度不改条目数。
+                    is ChatRenderItem.CollapsedSegmentItem -> CollapsedSegmentItemContent(
+                        item = item,
+                        env = itemEnv,
+                        revealLimit = reveal.limitFor(item.roundKey),
+                    )
+                    is ChatRenderItem.MessageItem -> ChatMessageItemContent(item = item, env = itemEnv)
                 }
             }
             if (waitingForFirstOutput) {
