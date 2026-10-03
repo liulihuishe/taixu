@@ -175,6 +175,9 @@ object TaiXuA2uiRenderer {
                                 eventName = message.type,
                                 context = message.context,
                                 timestamp = message.timestamp,
+                                // 引擎已随事件回传数据模型（含用户在输入类组件里填的值），
+                                // 宿主此前只搬 context 把它丢掉了 —— 见 A2uiUserEvent.dataModel。
+                                dataModel = message.clientDataModel?.surfaces,
                             ),
                         )
                     }

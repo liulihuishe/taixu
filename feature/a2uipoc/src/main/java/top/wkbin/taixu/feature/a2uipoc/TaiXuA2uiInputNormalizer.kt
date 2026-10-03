@@ -16,17 +16,16 @@ import kotlinx.serialization.json.jsonPrimitive
  *
  * 背景（源码级已核实）：官方 A2uiBasicCatalogV1 的这五类组件都用
  * `val onValueChange = properties.bindUpdater(ValueProperty)`、`val isEnabled = onValueChange != null`
- * 判定是否可交互；而 `A2uiComponentScopeImpl.bindUpdater` 只在 `value` 形如
- * `{"path": "/xxx"}` 时才返回可写 updater，写常量则返回 null。
- * ∴ 模型写 `"value": "hello"` 时组件被**静默禁用**：能渲染、不能输入、不回传、且不给任何提示。
+ * 判定可交互性；而 `A2uiComponentScopeImpl.bindUpdater` 只在 `value` 形如 path 绑定时才返回可写
+ * updater，写常量则返回 null → 组件被**静默禁用**（能渲染、不能输入、不回传、无提示）。
  *
- * 本归一化器把常量 `value` 改写为数据绑定 `{"path": "/__taixu_inputs/<组件id>"}`，
- * 并追加一条 `updateDataModel` 把原常量种进数据模型。于是：
- * 1) `isEnabled` 变为 true，组件真正可用；
- * 2) 用户输入由官方 updater 写回数据模型（路径固定可预测）；
- * 3) 数据模型在 `sendDataModel = true` 时会随出站事件自动带回给智能体。
+ * 本归一化器把常量 value 改写为数据绑定 `{"path": "/__taixu_inputs/<组件id>"}`，
+ * 并在**引用它的 updateComponents 之前**插入 updateDataModel 把原常量种进数据模型。
+ * 顺序至关重要：CheckBox/Slider 用 `checkNotNull(properties.bind(ValueProperty))` 取值，
+ * 路径若尚未种值会解析为 null → 组件当场抛错而**完全不渲染**（TextField 无 checkNotNull，
+ * 所以历史上只有它看起来是好的）；种子必须先生效。
  *
- * 幂等：已是 `{"path": ...}` 的 value 不改写，重复调用结果一致。
+ * 幂等：已是数据绑定的 value 不改写，重复归一化结果一致。
  */
 internal object TaiXuA2uiInputNormalizer {
 
@@ -36,7 +35,6 @@ internal object TaiXuA2uiInputNormalizer {
     private val VALUE_COMPONENT_TYPES =
         setOf("TextField", "CheckBox", "ChoicePicker", "Slider", "DateTimeInput")
 
-    /** [messagesJson] 为归一化后的协议消息数组；[paths] 为 surfaceId -> (组件id -> 数据模型路径)。 */
     data class Result(
         val messagesJson: String,
         val paths: Map<String, Map<String, String>>,
@@ -46,13 +44,14 @@ internal object TaiXuA2uiInputNormalizer {
 
     fun normalize(messagesJson: String): Result {
         val array = Json.parseToJsonElement(messagesJson).jsonArray
-        val seeds = mutableListOf<JsonElement>()
         val paths = mutableMapOf<String, Map<String, String>>()
         var fixedCount = 0
         var dataModelForced = false
 
-        val rewritten = array.map { element ->
+        val rewritten = array.flatMap { element ->
             val message = element.jsonObject.toMutableMap()
+            val seeds = mutableListOf<JsonElement>()
+
             // sendDataModel 默认关闭 → 出站事件不带数据模型，用户输入的值就回不到智能体。
             // 打开后，用户与卡片的任何交互都会把整棵数据模型（含输入值）附在事件里带回。
             message["createSurface"]?.jsonObject?.let { surface ->
@@ -61,9 +60,13 @@ internal object TaiXuA2uiInputNormalizer {
                     dataModelForced = true
                 }
             }
-            val update = message["updateComponents"]?.jsonObject?.toMutableMap() ?: return@map JsonObject(message)
-            val surfaceId = update["surfaceId"]?.jsonPrimitive?.contentOrNull ?: return@map element
-            val components = update["components"]?.jsonArray ?: return@map element
+
+            val update = message["updateComponents"]?.jsonObject?.toMutableMap()
+                ?: return@flatMap listOf(JsonObject(message))
+            val surfaceId = update["surfaceId"]?.jsonPrimitive?.contentOrNull
+                ?: return@flatMap listOf(JsonObject(message))
+            val components = update["components"]?.jsonArray
+                ?: return@flatMap listOf(JsonObject(message))
 
             val perSurface = mutableMapOf<String, String>()
             val normalized = components.map { component ->
@@ -96,13 +99,14 @@ internal object TaiXuA2uiInputNormalizer {
                 JsonObject(obj)
             }
 
-            if (perSurface.isEmpty()) return@map element
+            if (perSurface.isEmpty()) return@flatMap listOf(JsonObject(message))
             update["components"] = JsonArray(normalized)
             message["updateComponents"] = JsonObject(update)
             paths[surfaceId] = perSurface
-            JsonObject(message)
+            // 种子必须先于引用它的 updateComponents 生效，否则组件取值拿到 null。
+            seeds + JsonObject(message)
         }
 
-        return Result(JsonArray(rewritten + seeds).toString(), paths, fixedCount, dataModelForced)
+        return Result(JsonArray(rewritten).toString(), paths, fixedCount, dataModelForced)
     }
 }

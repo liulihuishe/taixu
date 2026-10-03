@@ -47,6 +47,12 @@ object A2uiSurfaceBus {
         val eventName: String,
         val context: Map<String, Any?>,
         val timestamp: Long,
+        /**
+         * 引擎随事件回传的数据模型（`A2uiClientEventMessage.clientDataModel.surfaces`），
+         * 键为 surfaceId。**用户填进输入类组件的值就在这里**——此前宿主只搬了 [context]，
+         * 把这份数据丢弃，导致「提交后事件里没有值」。
+         */
+        val dataModel: Map<String, Any?>? = null,
     )
 
     /** A2UI 引擎运行时错误（组件被目录校验拒绝、surface 状态异常等），同样回传给智能体。 */
@@ -121,10 +127,26 @@ object A2uiSurfaceBus {
     }
 
     /** 把用户交互事件格式化为注入 agent 会话的消息文本。 */
+    /** 回传给智能体的数据模型截断上限（字符），避免一次交互塞爆上下文。 */
+    private const val MAX_DATA_MODEL_CHARS = 2000
+
     fun formatUserEvent(event: A2uiUserEvent): String = buildString {
         append("[A2UI 界面事件] 用户在界面「${event.surfaceTitle}」（surfaceId=${event.surfaceId}）")
         append("上触发了交互：组件 componentId=${event.componentId}，事件 eventName=${event.eventName}")
         if (event.context.isNotEmpty()) append("，携带 context=${event.context}")
+        // 输入类组件的值由引擎随事件回传，此前被丢弃；这里渲染给智能体，
+        // 否则模型只能看到"用户点了某个组件"，拿不到用户到底填了什么。
+        val surfaceData = event.dataModel?.get(event.surfaceId)
+        if (surfaceData != null) {
+            val rendered = surfaceData.toString()
+            append("，界面数据模型=")
+            if (rendered.length <= MAX_DATA_MODEL_CHARS) {
+                append(rendered)
+            } else {
+                append(rendered.take(MAX_DATA_MODEL_CHARS)).append("…（已截断）")
+            }
+            append("（路径 /__taixu_inputs/<组件id> 存放的即用户在输入类组件中实际填写或选择的值）")
+        }
         append("。这是 A2UI 界面的用户交互回传，请根据事件语义继续处理；")
         append("如需更新界面，用相同 surfaceId 调用 render_surface 并只携带 updateComponents 消息。")
     }

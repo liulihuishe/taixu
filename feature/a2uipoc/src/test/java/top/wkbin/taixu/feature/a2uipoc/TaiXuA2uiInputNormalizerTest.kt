@@ -78,6 +78,20 @@ class TaiXuA2uiInputNormalizerTest {
     }
 
     @Test
+    fun `data model seeds are emitted before the components that reference them`() {
+        // CheckBox/Slider 用 checkNotNull(bind(ValueProperty)) 取值：路径若还没种值就解析为
+        // null，组件当场抛错、完全不渲染。所以种子必须排在 updateComponents 之前。
+        val result = TaiXuA2uiInputNormalizer.normalize(payload("CheckBox", "true"))
+        val keys = Json.parseToJsonElement(result.messagesJson).jsonArray.map { it.jsonObject.keys }
+
+        val seedIndex = keys.indexOfFirst { it.contains("updateDataModel") }
+        val componentsIndex = keys.indexOfFirst { it.contains("updateComponents") }
+        assertTrue("必须存在种值消息", seedIndex >= 0)
+        assertTrue("必须存在组件消息", componentsIndex >= 0)
+        assertTrue("种值消息($seedIndex) 必须先于组件消息($componentsIndex)", seedIndex < componentsIndex)
+    }
+
+    @Test
     fun `non value components and unrelated messages are untouched`() {
         val text = "[{\"updateComponents\":{\"surfaceId\":\"s1\",\"components\":[" +
             "{\"id\":\"root\",\"component\":\"Column\",\"children\":[\"t1\"]}," +

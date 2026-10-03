@@ -63,7 +63,7 @@ internal class RoundRevealState {
     }
 
     private companion object {
-        const val REVEAL_PER_FRAME = 3
+        const val REVEAL_PER_FRAME = 1
     }
 }
 
