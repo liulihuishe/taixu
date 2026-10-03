@@ -40,6 +40,12 @@ jobs:
       - name: Grant Execute Permission for Gradlew
         run: chmod +x gradlew
 
+      # 临时步骤：手机 PRoot 沙箱缺 Gradle 9.7 / AGP 9.4 / android-37 平台，
+      # 无法本地跑 ./gradlew testDebugUnitTest，故借用本工作流执行全量单测。
+      # 验证通过后在本分支回退该步骤，保证交付物不含 .github 变更。
+      - name: Run Unit Tests (temporary, reverted before delivery)
+        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
       - name: Build TaiXuDev APK
         env:
           TAIXU_DEV_BUILD: "1"
